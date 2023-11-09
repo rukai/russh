@@ -12,8 +12,11 @@ use clap::Parser;
 use log::info;
 use russh::*;
 use russh_keys::*;
-use tokio::io::AsyncWriteExt;
+use std::io::Write;
+use tokio::io::{AsyncReadExt, BufReader};
 use tokio::net::ToSocketAddrs;
+
+const FILE_LEN: usize = 1024 * 1024 * 10; // 10MB
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -36,17 +39,15 @@ async fn main() -> Result<()> {
     .await?;
     info!("Connected");
 
-    let code = ssh
-        .call(
-            &cli.command
-                .into_iter()
-                .map(|x| shell_escape::escape(x.into())) // arguments are escaped manually since the SSH protocol doesn't support quoting
-                .collect::<Vec<_>>()
-                .join(" "),
-        )
-        .await?;
+    for i in 0..50 {
+        ssh.push_file_from_bytes(&vec![0; FILE_LEN], "foo").await;
+        let wc_out = ssh.call("wc -c foo").await.unwrap().trim().to_owned();
+        println!("attempt #{i} {wc_out}");
+        let length: usize = wc_out.split_whitespace().next().unwrap().parse().unwrap();
 
-    println!("Exitcode: {:?}", code);
+        assert_eq!(length, FILE_LEN);
+    }
+
     ssh.close().await?;
     Ok(())
 }
@@ -101,12 +102,12 @@ impl Session {
         Ok(Self { session })
     }
 
-    async fn call(&mut self, command: &str) -> Result<u32> {
+    async fn call(&mut self, command: &str) -> Result<String> {
         let mut channel = self.session.channel_open_session().await?;
         channel.exec(true, command).await?;
 
-        let mut code = 0;
-        let mut stdout = tokio::io::stdout();
+        let mut stdout = vec![];
+        let mut stderr = vec![];
 
         loop {
             // There's an event available on the session channel
@@ -116,19 +117,40 @@ impl Session {
             match msg {
                 // Write data to the terminal
                 ChannelMsg::Data { ref data } => {
-                    stdout.write_all(data).await?;
-                    stdout.flush().await?;
+                    Write::write_all(&mut stdout, data)?;
+                }
+                ChannelMsg::ExtendedData { data, ext } => {
+                    if ext == 1 {
+                        Write::write_all(&mut stderr, &data).unwrap()
+                    } else {
+                        println!(
+                            "received unknown extended data with extension type {ext} containing: {:?}",
+                            data.to_vec()
+                        )
+                    }
                 }
                 // The command has returned an exit code
                 ChannelMsg::ExitStatus { exit_status } => {
-                    code = exit_status;
+                    assert_eq!(exit_status, 0);
                     channel.eof().await?;
                     break;
                 }
+                ChannelMsg::ExitSignal {
+                    signal_name,
+                    core_dumped,
+                    error_message,
+                    ..
+                } => panic!(
+                    "killed via signal {:?} core_dumped={} {:?}",
+                    signal_name, core_dumped, error_message
+                ),
                 _ => {}
             }
         }
-        Ok(code)
+        if !stderr.is_empty() {
+            panic!("stderr:{}", String::from_utf8(stderr).unwrap())
+        }
+        Ok(String::from_utf8(stdout).unwrap())
     }
 
     async fn close(&mut self) -> Result<()> {
@@ -136,6 +158,71 @@ impl Session {
             .disconnect(Disconnect::ByApplication, "", "English")
             .await?;
         Ok(())
+    }
+
+    /// Create a file on the remote machine at `dest` with the provided bytes.
+    pub async fn push_file_from_bytes(&self, bytes: &[u8], dest: &str) {
+        let source = BufReader::new(bytes);
+        self.push_file_impl(source, dest).await;
+    }
+
+    async fn push_file_impl<R: AsyncReadExt + Unpin>(&self, source: R, dest: &str) {
+        let mut channel = self.session.channel_open_session().await.unwrap();
+        let command = format!("rm {0}\ncat > '{0}'\nchmod 777 {0}", dest);
+        channel.exec(true, command).await.unwrap();
+
+        let mut stdout = vec![];
+        let mut stderr = vec![];
+        let mut status = None;
+        let mut failed = None;
+        channel.data(source).await.unwrap();
+        channel.eof().await.unwrap();
+        while let Some(msg) = channel.wait().await {
+            match msg {
+                ChannelMsg::Data { data } => Write::write_all(&mut stdout, &data).unwrap(),
+                ChannelMsg::ExtendedData { data, ext } => {
+                    if ext == 1 {
+                        Write::write_all(&mut stderr, &data).unwrap()
+                    } else {
+                        println!(
+                            "received unknown extended data with extension type {ext} containing: {:?}",
+                            data.to_vec()
+                        )
+                    }
+                }
+                ChannelMsg::ExitStatus { exit_status } => {
+                    status = Some(exit_status);
+                    // cant exit immediately, there might be more data still
+                }
+                ChannelMsg::ExitSignal {
+                    signal_name,
+                    core_dumped,
+                    error_message,
+                    ..
+                } => {
+                    failed = Some(format!(
+                    "killed via signal {signal_name:?} core_dumped={core_dumped} {error_message:?}"
+                ))
+                }
+                _ => {}
+            }
+        }
+
+        let stdout = String::from_utf8(stdout).unwrap();
+        let stderr = String::from_utf8(stderr).unwrap();
+
+        if let Some(failed) = failed {
+            panic!("{}\n{}\n{}", failed, stdout, stderr)
+        }
+
+        match status {
+            Some(status) => {
+                if status != 0 {
+                    panic!("failed with exit code {}\n{}\n{}", status, stdout, stderr)
+                }
+            }
+            None => panic!("did not exit cleanly\n{}\n{}", stdout, stderr),
+        }
     }
 }
 
@@ -153,7 +240,4 @@ pub struct Cli {
 
     #[clap(long, short = 'k')]
     private_key: PathBuf,
-
-    #[clap(multiple = true, index = 2, required = true)]
-    command: Vec<String>,
 }
